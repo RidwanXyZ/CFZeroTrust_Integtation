@@ -1,10 +1,11 @@
+
 /**
  * sync-hagezi.js
  * Fetch Hagezi lists → auto-split per 1000 → upsert to Cloudflare Gateway Lists
  * lalu update DNS & HTTP Policy tanpa restart dari awal kalau kena limit.
  *
  * Run:
- *   CF_ACCOUNT_ID=... CF_API_TOKEN=... CF_DNS_POLICY_ID=... CF_HTTP_POLICY_ID=... node sync-hagezi.js
+ * CF_ACCOUNT_ID=... CF_API_TOKEN=... CF_DNS_POLICY_ID=... CF_HTTP_POLICY_ID=... node sync-hagezi.js
  */
 
 const ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
@@ -60,7 +61,8 @@ async function sleep(ms) {
 
 function isRateLimitError(err) {
   const msg = String(err?.message || err);
-  return /429|rate limit|too many requests|quota/i.test(msg);
+  // PERBAIKAN: Menambahkan "2017" dan "maximum number of lists reached" ke dalam deteksi error
+  return /429|rate limit|too many requests|quota|maximum number of lists reached|2017/i.test(msg);
 }
 
 async function cfFetch(path, method = "GET", body = null) {
@@ -259,18 +261,19 @@ async function main() {
   mustEnv("CF_DNS_POLICY_ID");
   mustEnv("CF_HTTP_POLICY_ID");
 
-  // Collect existing Hagezi lists first so script can resume without recreating from zero.
   console.log("📋 Step 1: Scan existing Hagezi lists...");
   const allLists = await getAllLists();
   const existingHagezi = allLists.filter((l) => String(l.name || "").startsWith("hagezi-"));
   const existingByName = groupExistingListsByName(existingHagezi);
+  
+  // Ambil semua ID list Hagezi lama untuk dibersihkan dari rule policy nanti
+  const allOldListIds = existingHagezi.map(l => l.id);
 
   console.log(`  Existing Hagezi lists: ${existingHagezi.length}`);
 
   const allNewListIds = [];
   let creationHitLimit = false;
 
-  // Upsert phase: reuse existing list IDs; create missing ones only.
   console.log("\n📥 Step 2: Fetch & upsert Hagezi lists...");
   for (const hagezi of HAGEZI_LISTS) {
     console.log(`\n▶ Processing: ${hagezi.name}`);
@@ -300,7 +303,7 @@ async function main() {
         console.log(`  ✅ Created: ${listName} (${chunks[i].length} domains) → ID: ${id}`);
       } catch (err) {
         if (isRateLimitError(err)) {
-          console.log("  ⚠ Rate limit / limit kena. Stop create, lanjut update policy.");
+          console.log("  ⚠ Kuota list Cloudflare tercapai! Menghentikan pembuatan list baru dan lanjut update policy.");
           creationHitLimit = true;
           break;
         }
@@ -323,7 +326,8 @@ async function main() {
   console.log(`  Policy: "${dnsPolicy.name}"`);
   console.log(`  Traffic expression sebelum:\n  ${dnsPolicy.traffic}`);
 
-  const updatedDns = injectListIds(dnsPolicy, allNewListIds, "dns");
+  // PERBAIKAN: Melempar allOldListIds agar tidak terjadi duplikasi clause or
+  const updatedDns = injectListIds(dnsPolicy, allNewListIds, "dns", allOldListIds);
   await updatePolicy(DNS_POLICY_ID, updatedDns);
   console.log("  ✅ DNS Policy updated!");
 
@@ -333,11 +337,12 @@ async function main() {
   console.log(`  Policy: "${httpPolicy.name}"`);
   console.log(`  Traffic expression sebelum:\n  ${httpPolicy.traffic}`);
 
-  const updatedHttp = injectListIds(httpPolicy, allNewListIds, "http");
+  // PERBAIKAN: Melempar allOldListIds agar tidak terjadi duplikasi clause or
+  const updatedHttp = injectListIds(httpPolicy, allNewListIds, "http", allOldListIds);
   await updatePolicy(HTTP_POLICY_ID, updatedHttp);
   console.log("  ✅ HTTP Policy updated!");
 
-  console.log("\n🎉 Sync selesai! Semua list Hagezi berhasil dipush ke Cloudflare Gateway.");
+  console.log("\n🎉 Sync selesai! Semua list Hagezi yang berhasil diproses telah dipush ke Cloudflare Gateway.");
 }
 
 main().catch((err) => {
