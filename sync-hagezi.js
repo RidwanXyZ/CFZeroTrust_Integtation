@@ -173,6 +173,7 @@ async function main() {
     if (!process.env[key]) throw new Error(`Missing env: ${key}`);
   }
 
+  /**
   // 1. Hapus list Hagezi lama
   console.log("📋 Step 1: Cleanup existing Hagezi lists...");
   const allLists = await getAllLists();
@@ -202,7 +203,8 @@ async function main() {
   }
 
   console.log(`\n📊 Total lists created: ${allNewListIds.length}`);
-
+  **/
+  
   // 3. Update DNS Policy
   console.log("\n🔒 Step 3: Update DNS Policy...");
   const dnsPolicy = await getPolicy("dns", DNS_POLICY_ID);
