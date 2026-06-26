@@ -1,10 +1,11 @@
 /**
  * apply-hagezi-policies.js
- * SCRIPT DIAGNOSTIK & SINKRONISASI POLICY GATEWAY CLOUDFLARE
+ * SCRIPT SINKRONISASI POLICY GATEWAY CLOUDFLARE
  *
- * Diperbarui secara presisi berdasarkan API Cloudflare Zero Trust:
+ * Diperbarui secara presisi berdasarkan Skema API Cloudflare Zero Trust:
  * - Mengambil list dari: /gateway/lists
- * - Mengelola policy/rules melalui endpoint resmi: /teams/rules
+ * - Mengelola policy/rules melalui endpoint resmi: /gateway/rules
+ * - Mengirimkan payload PUT/POST yang valid (meliputi schedule, identity, device_posture, dll.)
  *
  * Run:
  * CF_ACCOUNT_ID=... CF_API_TOKEN=... node apply-hagezi-policies.js
@@ -31,8 +32,7 @@ function cfHeaders() {
 async function cfFetch(path, method = "GET", body = null) {
   const url = `${BASE_URL}${path}`;
   
-  // LOG KEAMANAN: Memastikan pemanggilan URL sudah benar
-  console.log(`  [Fetch Debug] ${method} ke: ${url.replace(API_TOKEN, "HIDDEN_TOKEN")}`);
+  console.log(`  [Fetch] ${method} ke: ${path}`);
 
   const res = await fetch(url, {
     method,
@@ -65,7 +65,7 @@ async function getGatewayLists() {
   let page = 1;
   const per_page = 100;
 
-  console.log("  [API] Mencari data list dari endpoint Gateway...");
+  console.log("  [API] Mengambil daftar list dari /gateway/lists...");
   while (true) {
     const json = await cfFetch(`/gateway/lists?per_page=${per_page}&page=${page}`);
     const result = json.result || [];
@@ -82,24 +82,44 @@ async function getGatewayLists() {
 }
 
 /**
- * Berdasarkan API resmi Cloudflare Teams/Gateway:
- * Mengambil daftar policy menggunakan endpoint: GET /accounts/{account_id}/teams/rules
+ * Mendapatkan seluruh rules melalui endpoint resmi: GET /gateway/rules
  */
 async function getGatewayPolicies() {
-  const json = await cfFetch("/teams/rules");
+  const json = await cfFetch("/gateway/rules");
   return json.result || [];
 }
 
 /**
- * Membuat policy baru menggunakan endpoint: POST /accounts/{account_id}/teams/rules
+ * Membuat rule baru melalui endpoint resmi: POST /gateway/rules
+ * Payload disesuaikan agar menyertakan parameter wajib identity dan device_posture
  */
 async function createGatewayPolicy(payload) {
-  const json = await cfFetch("/teams/rules", "POST", payload);
+  const finalPayload = {
+    name: payload.name,
+    description: payload.description,
+    action: payload.action,
+    enabled: payload.enabled,
+    traffic: payload.traffic,
+    filters: payload.filters,
+    precedence: payload.precedence,
+    identity: payload.identity || "",
+    device_posture: payload.device_posture || "",
+    rule_settings: payload.rule_settings || {}
+  };
+
+  // Kirim schedule jika didefinisikan saat pembuatan
+  if (payload.schedule) {
+    finalPayload.schedule = payload.schedule;
+  }
+
+  const json = await cfFetch("/gateway/rules", "POST", finalPayload);
   return json.result;
 }
 
 /**
- * Memperbarui policy menggunakan endpoint: PUT /accounts/{account_id}/teams/rules/{rule_id}
+ * Memperbarui rule lama melalui endpoint resmi: PUT /gateway/rules/{rule_id}
+ * Diperbarui: Memetakan struktur schedule, identity, device_posture, dan expiration asli
+ * agar tidak rusak atau hilang saat melakukan update PUT.
  */
 async function updateGatewayPolicy(policyId, updatedPolicy) {
   const payload = {
@@ -110,10 +130,22 @@ async function updateGatewayPolicy(policyId, updatedPolicy) {
     traffic: updatedPolicy.traffic,
     filters: updatedPolicy.filters,
     precedence: updatedPolicy.precedence,
+    identity: updatedPolicy.identity || "",
+    device_posture: updatedPolicy.device_posture || "",
     rule_settings: updatedPolicy.rule_settings || {}
   };
 
-  await cfFetch(`/teams/rules/${policyId}`, "PUT", payload);
+  // Pertahankan konfigurasi schedule jika ada pada objek yang di-get sebelumnya
+  if (updatedPolicy.schedule) {
+    payload.schedule = updatedPolicy.schedule;
+  }
+
+  // Pertahankan konfigurasi expiration (untuk DNS Policy timed-out) jika ada
+  if (updatedPolicy.expiration) {
+    payload.expiration = updatedPolicy.expiration;
+  }
+
+  await cfFetch(`/gateway/rules/${policyId}`, "PUT", payload);
 }
 
 function buildClause(id, trafficKey) {
@@ -128,7 +160,6 @@ async function main() {
   mustEnv("CF_ACCOUNT_ID");
   mustEnv("CF_API_TOKEN");
 
-  // Verifikasi Konfigurasi awal
   console.log(`⚙️  Verifikasi Konfigurasi:`);
   console.log(`   - Account ID: ${ACCOUNT_ID}`);
   console.log(`   - API Token : ${API_TOKEN ? `${API_TOKEN.substring(0, 6)}...` : "TIDAK TERDETEKSI"}`);
@@ -144,12 +175,7 @@ async function main() {
   
   console.log(`\n🔍 Total list yang ditemukan di Gateway: ${allLists.length}`);
   
-  if (allLists.length > 0) {
-    console.log("📋 Daftar 5 List Pertama yang berhasil dideteksi oleh API:");
-    allLists.slice(0, 5).forEach((l, idx) => {
-      console.log(`   [${idx + 1}] Nama: "${l.name}" | ID: ${l.id} | Tipe: ${l.type || l.kind}`);
-    });
-  } else {
+  if (allLists.length === 0) {
     throw new Error("Tidak ada list yang terdeteksi di akun Anda.");
   }
 
@@ -163,10 +189,10 @@ async function main() {
     throw new Error("Tidak ditemukan list 'hagezi' di Zero Trust Gateway.");
   }
 
-  console.log(`\n✅ Berhasil menyaring ${hageziLists.length} list Hagezi.`);
+  console.log(`✅ Berhasil menyaring ${hageziLists.length} list Hagezi.`);
   const listIds = hageziLists.map(l => l.id);
 
-  // Ambil semua policy saat ini melalui endpoint resmi /teams/rules
+  // Ambil semua policy saat ini secara konsisten dari /gateway/rules
   const allPolicies = await getGatewayPolicies();
 
   // ====================================================================
