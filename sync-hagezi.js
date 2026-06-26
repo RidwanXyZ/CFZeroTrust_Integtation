@@ -1,20 +1,18 @@
-
 /**
  * sync-hagezi.js
  * Fetch Hagezi lists → auto-split per 1000 → upsert to Cloudflare Gateway Lists
- * lalu update DNS & HTTP Policy tanpa restart dari awal kalau kena limit.
+ * lalu otomatis buat/update DNS & HTTP Policy dengan action BLOCK.
+ * * Script ini dirancang tangguh agar ketika limit Cloudflare tercapai,
+ * sistem akan langsung melanjutkan ke tahap pengaplikasian policy tanpa crash.
  *
  * Run:
- * CF_ACCOUNT_ID=... CF_API_TOKEN=... CF_DNS_POLICY_ID=... CF_HTTP_POLICY_ID=... node sync-hagezi.js
+ * CF_ACCOUNT_ID=... CF_API_TOKEN=... node sync-hagezi.js
  */
 
 const ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
 const API_TOKEN = process.env.CF_API_TOKEN;
-const DNS_POLICY_ID = process.env.CF_DNS_POLICY_ID;
-const HTTP_POLICY_ID = process.env.CF_HTTP_POLICY_ID;
 
 const BASE_URL = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}`;
-const STATE_FILE = "./.sync-hagezi-state.json";
 
 const HAGEZI_LISTS = [
   {
@@ -39,7 +37,6 @@ const HAGEZI_LISTS = [
   },
 ];
 
-// Keep safe for Cloudflare list item limits.
 const CHUNK_SIZE = 1000;
 
 function mustEnv(name) {
@@ -59,10 +56,14 @@ async function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Audit Error Detection:
+ * Memastikan semua jenis error limitasi (Rate Limit HTTP 429, Kuota Akun, Limit Jumlah List, dll)
+ * terdeteksi dengan akurat agar tidak menghentikan jalannya script secara paksa.
+ */
 function isRateLimitError(err) {
-  const msg = String(err?.message || err);
-  // PERBAIKAN: Menambahkan "2017" dan "maximum number of lists reached" ke dalam deteksi error
-  return /429|rate limit|too many requests|quota|maximum number of lists reached|2017/i.test(msg);
+  const msg = String(err?.message || err || "").toLowerCase();
+  return /429|rate limit|too many requests|quota|limit reached|maximum number of lists|2017/i.test(msg);
 }
 
 async function cfFetch(path, method = "GET", body = null) {
@@ -179,11 +180,6 @@ async function getAllLists() {
   return all;
 }
 
-async function deleteList(id, name) {
-  await cfFetch(`/rules/lists/${id}`, "DELETE");
-  console.log(`  🗑 Deleted old list: ${name} (${id})`);
-}
-
 async function createList(name, description, domains) {
   const createJson = await cfFetch("/rules/lists", "POST", {
     kind: "hostname",
@@ -226,8 +222,13 @@ async function waitForBulkOperation(operationId) {
   throw new Error(`Bulk operation timeout: ${operationId}`);
 }
 
-async function getPolicy(policyId) {
-  const json = await cfFetch(`/gateway/rules/${policyId}`);
+async function getAllPolicies() {
+  const json = await cfFetch("/gateway/rules");
+  return json.result || [];
+}
+
+async function createPolicy(payload) {
+  const json = await cfFetch("/gateway/rules", "POST", payload);
   return json.result;
 }
 
@@ -258,15 +259,11 @@ async function main() {
 
   mustEnv("CF_ACCOUNT_ID");
   mustEnv("CF_API_TOKEN");
-  mustEnv("CF_DNS_POLICY_ID");
-  mustEnv("CF_HTTP_POLICY_ID");
 
   console.log("📋 Step 1: Scan existing Hagezi lists...");
   const allLists = await getAllLists();
   const existingHagezi = allLists.filter((l) => String(l.name || "").startsWith("hagezi-"));
   const existingByName = groupExistingListsByName(existingHagezi);
-  
-  // Ambil semua ID list Hagezi lama untuk dibersihkan dari rule policy nanti
   const allOldListIds = existingHagezi.map(l => l.id);
 
   console.log(`  Existing Hagezi lists: ${existingHagezi.length}`);
@@ -276,10 +273,18 @@ async function main() {
 
   console.log("\n📥 Step 2: Fetch & upsert Hagezi lists...");
   for (const hagezi of HAGEZI_LISTS) {
+    if (creationHitLimit) break;
+    
     console.log(`\n▶ Processing: ${hagezi.name}`);
 
-    const domains = await fetchDomains(hagezi.url);
-    console.log(`  Total domains: ${domains.length.toLocaleString()}`);
+    let domains = [];
+    try {
+      domains = await fetchDomains(hagezi.url);
+      console.log(`  Total domains: ${domains.length.toLocaleString()}`);
+    } catch (fetchErr) {
+      console.error(`  ❌ Failed to fetch domain list from URL: ${fetchErr.message}. Skipping to next.`);
+      continue;
+    }
 
     const chunks = chunkArray(domains, CHUNK_SIZE);
     console.log(`  Split jadi ${chunks.length} list(s)`);
@@ -303,49 +308,92 @@ async function main() {
         console.log(`  ✅ Created: ${listName} (${chunks[i].length} domains) → ID: ${id}`);
       } catch (err) {
         if (isRateLimitError(err)) {
-          console.log("  ⚠ Kuota list Cloudflare tercapai! Menghentikan pembuatan list baru dan lanjut update policy.");
+          console.log("\n  ⚠ KUOTA / LIMIT LIST CLOUDFLARE TERCAPAI!");
+          console.log("  Mengehentikan proses pembuatan list baru, melompat langsung ke pengaplikasian DNS & HTTP policy...");
           creationHitLimit = true;
-          break;
+          break; // Keluar dari loop chunk saat ini
         }
-        throw err;
+        throw err; // Jika error di luar limitasi Cloudflare, hentikan script
       }
     }
-
-    if (creationHitLimit) break;
   }
 
+  // Audit safety check: Jika tidak ada satupun ID yang siap diproses, jangan jalankan update policy
   if (allNewListIds.length === 0) {
-    throw new Error("No Hagezi list IDs available. Policy update skipped.");
+    throw new Error("Tidak ada Hagezi list ID yang tersedia untuk dikonfigurasi. Proses dibatalkan.");
   }
 
-  console.log(`\n📊 List ID ready: ${allNewListIds.length}`);
+  console.log(`\n📊 Total List ID yang siap digunakan: ${allNewListIds.length}`);
 
-  // Update DNS Policy
-  console.log("\n🔒 Step 3: Update DNS Policy...");
-  const dnsPolicy = await getPolicy(DNS_POLICY_ID);
-  console.log(`  Policy: "${dnsPolicy.name}"`);
-  console.log(`  Traffic expression sebelum:\n  ${dnsPolicy.traffic}`);
+  // Mengambil daftar semua Firewall Policies yang ada
+  const allPolicies = await getAllPolicies();
 
-  // PERBAIKAN: Melempar allOldListIds agar tidak terjadi duplikasi clause or
-  const updatedDns = injectListIds(dnsPolicy, allNewListIds, "dns", allOldListIds);
-  await updatePolicy(DNS_POLICY_ID, updatedDns);
-  console.log("  ✅ DNS Policy updated!");
+  // ==========================================
+  // STEP 3: APPLY TO DNS POLICY (FORCE BLOCK)
+  // ==========================================
+  console.log("\n🔒 Step 3: Apply to DNS Policy...");
+  const dnsPolicyName = "Hagezi Blocklist - DNS";
+  let dnsPolicy = process.env.CF_DNS_POLICY_ID 
+    ? allPolicies.find(p => p.id === process.env.CF_DNS_POLICY_ID)
+    : allPolicies.find(p => p.name === dnsPolicyName);
 
-  // Update HTTP Policy
-  console.log("\n🌐 Step 4: Update HTTP Policy...");
-  const httpPolicy = await getPolicy(HTTP_POLICY_ID);
-  console.log(`  Policy: "${httpPolicy.name}"`);
-  console.log(`  Traffic expression sebelum:\n  ${httpPolicy.traffic}`);
+  if (dnsPolicy) {
+    console.log(`  🔄 Mengupdate DNS Policy: "${dnsPolicy.name}"`);
+    const updatedDns = injectListIds(dnsPolicy, allNewListIds, "dns", allOldListIds);
+    updatedDns.action = "block"; 
+    updatedDns.enabled = true;
+    await updatePolicy(dnsPolicy.id, updatedDns);
+    console.log("  ✅ DNS Policy diperbarui & dipaksa ke mode BLOCK!");
+  } else {
+    console.log(`  ✨ Membuat DNS Policy baru: "${dnsPolicyName}"`);
+    const trafficExpression = allNewListIds.map(id => buildClause(id, "dns")).join(" or ");
+    await createPolicy({
+      name: dnsPolicyName,
+      description: "Auto-generated policy to block Hagezi lists",
+      action: "block",
+      enabled: true,
+      traffic: trafficExpression,
+      filters: ["dns"],
+      precedence: 1000
+    });
+    console.log("  ✅ DNS Policy baru dibuat dengan mode BLOCK!");
+  }
 
-  // PERBAIKAN: Melempar allOldListIds agar tidak terjadi duplikasi clause or
-  const updatedHttp = injectListIds(httpPolicy, allNewListIds, "http", allOldListIds);
-  await updatePolicy(HTTP_POLICY_ID, updatedHttp);
-  console.log("  ✅ HTTP Policy updated!");
+  // ==========================================
+  // STEP 4: APPLY TO HTTP POLICY (FORCE BLOCK)
+  // ==========================================
+  console.log("\n🌐 Step 4: Apply to HTTP Policy...");
+  const httpPolicyName = "Hagezi Blocklist - HTTP";
+  let httpPolicy = process.env.CF_HTTP_POLICY_ID 
+    ? allPolicies.find(p => p.id === process.env.CF_HTTP_POLICY_ID)
+    : allPolicies.find(p => p.name === httpPolicyName);
 
-  console.log("\n🎉 Sync selesai! Semua list Hagezi yang berhasil diproses telah dipush ke Cloudflare Gateway.");
+  if (httpPolicy) {
+    console.log(`  🔄 Mengupdate HTTP Policy: "${httpPolicy.name}"`);
+    const updatedHttp = injectListIds(httpPolicy, allNewListIds, "http", allOldListIds);
+    updatedHttp.action = "block";
+    updatedHttp.enabled = true;
+    await updatePolicy(httpPolicy.id, updatedHttp);
+    console.log("  ✅ HTTP Policy diperbarui & dipaksa ke mode BLOCK!");
+  } else {
+    console.log(`  ✨ Membuat HTTP Policy baru: "${httpPolicyName}"`);
+    const trafficExpression = allNewListIds.map(id => buildClause(id, "http")).join(" or ");
+    await createPolicy({
+      name: httpPolicyName,
+      description: "Auto-generated policy to block Hagezi lists via HTTP Inspection",
+      action: "block",
+      enabled: true,
+      traffic: trafficExpression,
+      filters: ["http"],
+      precedence: 1000
+    });
+    console.log("  ✅ HTTP Policy baru dibuat dengan mode BLOCK!");
+  }
+
+  console.log("\n🎉 Selesai! Semua domain list Hagezi yang berhasil diproses telah dipasang dan dikonfigurasi ke Cloudflare Gateway.");
 }
 
 main().catch((err) => {
-  console.error("\n❌ Error:", err.message);
+  console.error("\n❌ Fatal Error:", err.message);
   process.exit(1);
 });
