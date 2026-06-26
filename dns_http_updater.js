@@ -2,8 +2,9 @@
  * apply-hagezi-policies.js
  * SCRIPT DIAGNOSTIK & SINKRONISASI POLICY GATEWAY CLOUDFLARE
  *
- * Script ini dirancang khusus untuk mencari tahu mengapa list Cloudflare Anda 
- * tidak terbaca oleh API, sekaligus menerapkan policy jika berhasil terhubung.
+ * Diperbarui secara presisi berdasarkan API Cloudflare Zero Trust:
+ * - Mengambil list dari: /gateway/lists
+ * - Mengelola policy/rules melalui endpoint resmi: /teams/rules
  *
  * Run:
  * CF_ACCOUNT_ID=... CF_API_TOKEN=... node apply-hagezi-policies.js
@@ -64,7 +65,7 @@ async function getGatewayLists() {
   let page = 1;
   const per_page = 100;
 
-  console.log("  [API] Mencoba menarik data list dari endpoint resmi Gateway...");
+  console.log("  [API] Mencari data list dari endpoint Gateway...");
   while (true) {
     const json = await cfFetch(`/gateway/lists?per_page=${per_page}&page=${page}`);
     const result = json.result || [];
@@ -80,17 +81,26 @@ async function getGatewayLists() {
   return all;
 }
 
-// PERBAIKAN: Mengubah nama fungsi dari getAllPolicies menjadi getGatewayPolicies agar sesuai dengan pemanggilan di main()
+/**
+ * Berdasarkan API resmi Cloudflare Teams/Gateway:
+ * Mengambil daftar policy menggunakan endpoint: GET /accounts/{account_id}/teams/rules
+ */
 async function getGatewayPolicies() {
-  const json = await cfFetch("/gateway/rules");
+  const json = await cfFetch("/teams/rules");
   return json.result || [];
 }
 
+/**
+ * Membuat policy baru menggunakan endpoint: POST /accounts/{account_id}/teams/rules
+ */
 async function createGatewayPolicy(payload) {
-  const json = await cfFetch("/gateway/rules", "POST", payload);
+  const json = await cfFetch("/teams/rules", "POST", payload);
   return json.result;
 }
 
+/**
+ * Memperbarui policy menggunakan endpoint: PUT /accounts/{account_id}/teams/rules/{rule_id}
+ */
 async function updateGatewayPolicy(policyId, updatedPolicy) {
   const payload = {
     name: updatedPolicy.name,
@@ -103,7 +113,7 @@ async function updateGatewayPolicy(policyId, updatedPolicy) {
     rule_settings: updatedPolicy.rule_settings || {}
   };
 
-  await cfFetch(`/gateway/rules/${policyId}`, "PUT", payload);
+  await cfFetch(`/teams/rules/${policyId}`, "PUT", payload);
 }
 
 function buildClause(id, trafficKey) {
@@ -113,12 +123,12 @@ function buildClause(id, trafficKey) {
 }
 
 async function main() {
-  console.log("🚀 MEMULAI PROSES DIAGNOSTIK & SYNC GATEWAY CLOUDFLARE...\n");
+  console.log("🚀 MEMULAI PROSES SYNC GATEWAY CLOUDFLARE...\n");
 
   mustEnv("CF_ACCOUNT_ID");
   mustEnv("CF_API_TOKEN");
 
-  // Cetak 6 karakter pertama token untuk memastikan token terisi dengan benar (bukan kosong atau salah format)
+  // Verifikasi Konfigurasi awal
   console.log(`⚙️  Verifikasi Konfigurasi:`);
   console.log(`   - Account ID: ${ACCOUNT_ID}`);
   console.log(`   - API Token : ${API_TOKEN ? `${API_TOKEN.substring(0, 6)}...` : "TIDAK TERDETEKSI"}`);
@@ -129,11 +139,6 @@ async function main() {
   } catch (err) {
     console.log("\n❌ DIAGNOSTIK: Cloudflare menolak akses pemanggilan list!");
     console.log(`   Detail Error: ${err.message}`);
-    console.log("\n💡 SOLUSI:");
-    console.log("   1. Pastikan Account ID di atas sudah persis sama dengan yang ada di URL dashboard Anda.");
-    console.log("   2. Pastikan API Token Anda memiliki hak akses 'Zero Trust' dan 'Lists'.");
-    console.log("      Cara verifikasi token: Masuk ke Cloudflare Dashboard > My Profile > API Tokens.");
-    console.log("      Edit token Anda dan tambahkan izin: 'Account' > 'Zero Trust' > 'Edit'.\n");
     throw err;
   }
   
@@ -145,10 +150,7 @@ async function main() {
       console.log(`   [${idx + 1}] Nama: "${l.name}" | ID: ${l.id} | Tipe: ${l.type || l.kind}`);
     });
   } else {
-    console.log("\n⚠️  DIAGNOSTIK: API berhasil terhubung, tetapi mengembalikan 0 list.");
-    console.log("   Artinya API Token Anda valid, namun diarahkan ke akun yang kosong, atau");
-    console.log("   akun Anda belum memiliki list sama sekali di menu Zero Trust > Reusable Components.");
-    throw new Error("Tidak ada list yang terdeteksi.");
+    throw new Error("Tidak ada list yang terdeteksi di akun Anda.");
   }
 
   // Filter list yang mengandung kata "hagezi" (Case-Insensitive)
@@ -158,18 +160,28 @@ async function main() {
   });
 
   if (hageziLists.length === 0) {
-    console.log("\n⚠️  DIAGNOSTIK:");
-    console.log("   List berhasil dibaca dari API, tetapi tidak ada yang mengandung nama 'hagezi'.");
-    console.log("   Silakan ganti nama list Anda di dashboard agar mengandung kata 'hagezi' atau");
-    console.log("   sesuaikan kata kunci penyaring di script ini.");
     throw new Error("Tidak ditemukan list 'hagezi' di Zero Trust Gateway.");
   }
 
   console.log(`\n✅ Berhasil menyaring ${hageziLists.length} list Hagezi.`);
   const listIds = hageziLists.map(l => l.id);
 
-  // Ambil semua policy saat ini
+  // Ambil semua policy saat ini melalui endpoint resmi /teams/rules
   const allPolicies = await getGatewayPolicies();
+
+  // ====================================================================
+  // MENENTUKAN PRECEDENCE (PRIORITAS) UNIK SECARA DINAMIS
+  // ====================================================================
+  const existingPrecedences = allPolicies.map(p => p.precedence || 0);
+  const maxPrecedence = existingPrecedences.length > 0 ? Math.max(...existingPrecedences) : 1000;
+  
+  const dnsPrecedenceValue = maxPrecedence + 10;
+  const httpPrecedenceValue = maxPrecedence + 20;
+
+  console.log(`\n🛡️  Auto-Precedence:`);
+  console.log(`   - Precedence tertinggi saat ini : ${maxPrecedence}`);
+  console.log(`   - Precedence yang akan dialokasikan untuk DNS : ${dnsPrecedenceValue}`);
+  console.log(`   - Precedence yang akan dialokasikan untuk HTTP: ${httpPrecedenceValue}`);
 
   // ==========================================
   // STEP 2: KONFIGURASI DNS POLICY (BLOCK)
@@ -188,7 +200,7 @@ async function main() {
     await updateGatewayPolicy(dnsPolicy.id, dnsPolicy);
     console.log("  ✅ DNS Policy sukses diperbarui!");
   } else {
-    console.log(`  ✨ Policy "${dnsPolicyName}" tidak ditemukan. Membuat baru...`);
+    console.log(`  ✨ Policy "${dnsPolicyName}" tidak ditemukan. Membuat baru dengan precedence ${dnsPrecedenceValue}...`);
     await createGatewayPolicy({
       name: dnsPolicyName,
       description: "Auto-generated policy to block Hagezi lists",
@@ -196,7 +208,7 @@ async function main() {
       enabled: true,
       traffic: dnsTrafficExpression,
       filters: ["dns"],
-      precedence: 1000
+      precedence: dnsPrecedenceValue
     });
     console.log("  ✅ DNS Policy baru berhasil dibuat dengan action BLOCK!");
   }
@@ -218,7 +230,7 @@ async function main() {
     await updateGatewayPolicy(httpPolicy.id, httpPolicy);
     console.log("  ✅ HTTP Policy sukses diperbarui!");
   } else {
-    console.log(`  ✨ Policy "${httpPolicyName}" tidak ditemukan. Membuat baru...`);
+    console.log(`  ✨ Policy "${httpPolicyName}" tidak ditemukan. Membuat baru dengan precedence ${httpPrecedenceValue}...`);
     await createGatewayPolicy({
       name: httpPolicyName,
       description: "Auto-generated policy to block Hagezi lists via HTTP Inspection",
@@ -226,7 +238,7 @@ async function main() {
       enabled: true,
       traffic: httpTrafficExpression,
       filters: ["http"],
-      precedence: 1000
+      precedence: httpPrecedenceValue
     });
     console.log("  ✅ HTTP Policy baru berhasil dibuat dengan action BLOCK!");
   }
