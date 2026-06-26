@@ -34,7 +34,7 @@ const HAGEZI_LISTS = [
   },
 ];
 
-const CHUNK_SIZE = 1000;
+const CHUNK_SIZE = 1000000;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
