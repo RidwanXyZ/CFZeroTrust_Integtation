@@ -80,7 +80,8 @@ async function getGatewayLists() {
   return all;
 }
 
-async function getAllPolicies() {
+// PERBAIKAN: Mengubah nama fungsi dari getAllPolicies menjadi getGatewayPolicies agar sesuai dengan pemanggilan di main()
+async function getGatewayPolicies() {
   const json = await cfFetch("/gateway/rules");
   return json.result || [];
 }
