@@ -1,11 +1,9 @@
 /**
  * apply-hagezi-policies.js
- * Pindai daftar Zero Trust Gateway Lists ("hagezi-") yang sudah ada di akun Cloudflare,
- * lalu otomatis buat/update DNS Policy & HTTP Policy ke mode BLOCK.
+ * SCRIPT DIAGNOSTIK & SINKRONISASI POLICY GATEWAY CLOUDFLARE
  *
- * Diperbarui secara presisi berdasarkan Dokumentasi API Cloudflare Gateway:
- * - Menggunakan Endpoint Resmi: /gateway/lists dan /gateway/rules
- * - Menggunakan struktur Payload Gateway Rule yang valid.
+ * Script ini dirancang khusus untuk mencari tahu mengapa list Cloudflare Anda 
+ * tidak terbaca oleh API, sekaligus menerapkan policy jika berhasil terhubung.
  *
  * Run:
  * CF_ACCOUNT_ID=... CF_API_TOKEN=... node apply-hagezi-policies.js
@@ -31,6 +29,10 @@ function cfHeaders() {
 
 async function cfFetch(path, method = "GET", body = null) {
   const url = `${BASE_URL}${path}`;
+  
+  // LOG KEAMANAN: Memastikan pemanggilan URL sudah benar
+  console.log(`  [Fetch Debug] ${method} ke: ${url.replace(API_TOKEN, "HIDDEN_TOKEN")}`);
+
   const res = await fetch(url, {
     method,
     headers: cfHeaders(),
@@ -57,25 +59,19 @@ async function cfFetch(path, method = "GET", body = null) {
   return json;
 }
 
-/**
- * Berdasarkan Dokumentasi Resmi Cloudflare Zero Trust:
- * Mengambil daftar list dengan memanggil GET /accounts/{account_id}/gateway/lists
- */
 async function getGatewayLists() {
   const all = [];
   let page = 1;
   const per_page = 100;
 
-  console.log("  [API] Mengambil daftar Zero Trust Gateway Lists...");
+  console.log("  [API] Mencoba menarik data list dari endpoint resmi Gateway...");
   while (true) {
-    // Memanggil endpoint spesifik Gateway sesuai dokumentasi
     const json = await cfFetch(`/gateway/lists?per_page=${per_page}&page=${page}`);
     const result = json.result || [];
     all.push(...result);
 
-    console.log(`  [API] Berhasil membaca ${result.length} list pada halaman ${page}.`);
+    console.log(`  [API] Halaman ${page}: Berhasil membaca ${result.length} list.`);
     
-    // Periksa pagination
     const info = json.result_info;
     if (!info || page >= info.total_pages || result.length < per_page) break;
     page += 1;
@@ -84,25 +80,16 @@ async function getGatewayLists() {
   return all;
 }
 
-/**
- * Mengambil daftar aturan Gateway dengan memanggil GET /accounts/{account_id}/gateway/rules
- */
-async function getGatewayPolicies() {
+async function getAllPolicies() {
   const json = await cfFetch("/gateway/rules");
   return json.result || [];
 }
 
-/**
- * Membuat aturan Gateway baru dengan memanggil POST /accounts/{account_id}/gateway/rules
- */
 async function createGatewayPolicy(payload) {
   const json = await cfFetch("/gateway/rules", "POST", payload);
   return json.result;
 }
 
-/**
- * Memperbarui aturan Gateway yang ada dengan memanggil PUT /accounts/{account_id}/gateway/rules/{rule_id}
- */
 async function updateGatewayPolicy(policyId, updatedPolicy) {
   const payload = {
     name: updatedPolicy.name,
@@ -125,18 +112,45 @@ function buildClause(id, trafficKey) {
 }
 
 async function main() {
-  console.log("🚀 Memulai Sinkronisasi Policy Cloudflare Gateway...\n");
+  console.log("🚀 MEMULAI PROSES DIAGNOSTIK & SYNC GATEWAY CLOUDFLARE...\n");
 
   mustEnv("CF_ACCOUNT_ID");
   mustEnv("CF_API_TOKEN");
 
-  // Step 1: Ambil semua list dari Zero Trust Gateway
-  console.log("📋 Step 1: Memindai list di database Zero Trust Gateway...");
-  const allLists = await getGatewayLists();
+  // Cetak 6 karakter pertama token untuk memastikan token terisi dengan benar (bukan kosong atau salah format)
+  console.log(`⚙️  Verifikasi Konfigurasi:`);
+  console.log(`   - Account ID: ${ACCOUNT_ID}`);
+  console.log(`   - API Token : ${API_TOKEN ? `${API_TOKEN.substring(0, 6)}...` : "TIDAK TERDETEKSI"}`);
+
+  let allLists = [];
+  try {
+    allLists = await getGatewayLists();
+  } catch (err) {
+    console.log("\n❌ DIAGNOSTIK: Cloudflare menolak akses pemanggilan list!");
+    console.log(`   Detail Error: ${err.message}`);
+    console.log("\n💡 SOLUSI:");
+    console.log("   1. Pastikan Account ID di atas sudah persis sama dengan yang ada di URL dashboard Anda.");
+    console.log("   2. Pastikan API Token Anda memiliki hak akses 'Zero Trust' dan 'Lists'.");
+    console.log("      Cara verifikasi token: Masuk ke Cloudflare Dashboard > My Profile > API Tokens.");
+    console.log("      Edit token Anda dan tambahkan izin: 'Account' > 'Zero Trust' > 'Edit'.\n");
+    throw err;
+  }
   
   console.log(`\n🔍 Total list yang ditemukan di Gateway: ${allLists.length}`);
+  
+  if (allLists.length > 0) {
+    console.log("📋 Daftar 5 List Pertama yang berhasil dideteksi oleh API:");
+    allLists.slice(0, 5).forEach((l, idx) => {
+      console.log(`   [${idx + 1}] Nama: "${l.name}" | ID: ${l.id} | Tipe: ${l.type || l.kind}`);
+    });
+  } else {
+    console.log("\n⚠️  DIAGNOSTIK: API berhasil terhubung, tetapi mengembalikan 0 list.");
+    console.log("   Artinya API Token Anda valid, namun diarahkan ke akun yang kosong, atau");
+    console.log("   akun Anda belum memiliki list sama sekali di menu Zero Trust > Reusable Components.");
+    throw new Error("Tidak ada list yang terdeteksi.");
+  }
 
-  // Filter list yang tipenya adalah 'teams_list' atau 'hostname' dan mengandung nama 'hagezi'
+  // Filter list yang mengandung kata "hagezi" (Case-Insensitive)
   const hageziLists = allLists.filter((l) => {
     const nameLower = String(l.name || "").toLowerCase();
     return nameLower.includes("hagezi");
@@ -144,13 +158,13 @@ async function main() {
 
   if (hageziLists.length === 0) {
     console.log("\n⚠️  DIAGNOSTIK:");
-    console.log("   Daftar list kosong atau tidak ada yang mengandung nama 'hagezi'.");
-    console.log("   Berikut adalah daftar 5 nama list teratas di akun Anda saat ini:");
-    allLists.slice(0, 5).forEach(l => console.log(`   - "${l.name}" (ID: ${l.id})`));
+    console.log("   List berhasil dibaca dari API, tetapi tidak ada yang mengandung nama 'hagezi'.");
+    console.log("   Silakan ganti nama list Anda di dashboard agar mengandung kata 'hagezi' atau");
+    console.log("   sesuaikan kata kunci penyaring di script ini.");
     throw new Error("Tidak ditemukan list 'hagezi' di Zero Trust Gateway.");
   }
 
-  console.log(`  ✅ Berhasil menyaring ${hageziLists.length} list Hagezi.`);
+  console.log(`\n✅ Berhasil menyaring ${hageziLists.length} list Hagezi.`);
   const listIds = hageziLists.map(l => l.id);
 
   // Ambil semua policy saat ini
