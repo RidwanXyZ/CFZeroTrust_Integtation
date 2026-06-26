@@ -1,11 +1,10 @@
-
 /**
  * apply-hagezi-policies.js
  * Pindai daftar list "hagezi-" yang sudah ada di Cloudflare Gateway,
  * lalu otomatis buat/update DNS Policy & HTTP Policy ke mode BLOCK.
  *
- * Script ini TIDAK mendownload file dari internet ataupun membuat list baru,
- * sehingga sangat aman dari limitasi pembuatan list (Error 2017).
+ * Diperbarui: Peningkatan pencarian list (case-insensitive & auto-fallback)
+ * untuk mengatasi masalah pembacaan list kosong di Cloudflare.
  *
  * Run:
  * CF_ACCOUNT_ID=... CF_API_TOKEN=... node apply-hagezi-policies.js
@@ -61,11 +60,14 @@ async function getAllLists() {
   let page = 1;
   const per_page = 100;
 
+  console.log("  [API] Mengambil daftar list dari Cloudflare...");
   while (true) {
     const json = await cfFetch(`/rules/lists?per_page=${per_page}&page=${page}`);
     const result = json.result || [];
     all.push(...result);
 
+    console.log(`  [API] Halaman ${page}: Berhasil membaca ${result.length} list.`);
+    
     const info = json.result_info;
     if (!info || page >= info.total_pages) break;
     page += 1;
@@ -110,16 +112,38 @@ async function main() {
   mustEnv("CF_ACCOUNT_ID");
   mustEnv("CF_API_TOKEN");
 
-  // Step 1: Ambil semua list yang berawalan dengan "hagezi-"
-  console.log("📋 Step 1: Memindai list Hagezi yang sudah ada di akun Cloudflare...");
+  // Step 1: Ambil semua list dari Cloudflare
+  console.log("📋 Step 1: Memindai semua list yang ada di akun Cloudflare...");
   const allLists = await getAllLists();
-  const hageziLists = allLists.filter((l) => String(l.name || "").startsWith("hagezi-"));
-
-  if (hageziLists.length === 0) {
-    throw new Error("Tidak ditemukan list dengan nama berawalan 'hagezi-' di akun Cloudflare kamu. Silakan buat list terlebih dahulu.");
+  
+  console.log(`\n🔍 Total list ditemukan di akun: ${allLists.length}`);
+  if (allLists.length > 0) {
+    console.log("  Sampel nama 5 list pertama di akun Anda:");
+    allLists.slice(0, 5).forEach(l => console.log(`  - Name: "${l.name}" | ID: ${l.id} | Type: ${l.kind}`));
   }
 
-  console.log(`  ✅ Ditemukan ${hageziLists.length} list Hagezi siap pakai.`);
+  // Cari list dengan nama yang mengandung kata "hagezi" (Case-Insensitive)
+  let hageziLists = allLists.filter((l) => {
+    const nameLower = String(l.name || "").toLowerCase();
+    return nameLower.includes("hagezi");
+  });
+
+  // JIKA MASIH KOSONG: Lakukan fallback dengan mencari list hostname apa saja yang bukan bawaan system
+  if (hageziLists.length === 0) {
+    console.log("\n  ⚠️  PERINGATAN: Tidak ada list dengan nama mengandung kata 'hagezi' (case-insensitive).");
+    console.log("  Mencoba mencari list tipe 'hostname' cadangan...");
+    hageziLists = allLists.filter((l) => l.kind === "hostname");
+  }
+
+  if (hageziLists.length === 0) {
+    throw new Error(
+      "Gagal mendeteksi list apa pun di akun Cloudflare Anda. " +
+      "Pastikan API Token Anda memiliki izin 'Rules: Read' dan 'Account: Lists Read'."
+    );
+  }
+
+  console.log(`\n  ✅ Sukses mencocokkan ${hageziLists.length} list untuk digunakan.`);
+  hageziLists.forEach(l => console.log(`    -> Menggunakan List: "${l.name}" (${l.id})`));
 
   const listIds = hageziLists.map(l => l.id);
 
@@ -133,7 +157,6 @@ async function main() {
   const dnsPolicyName = "Hagezi Blocklist - DNS";
   const dnsTrafficExpression = listIds.map(id => buildClause(id, "dns")).join(" or ");
   
-  // Cari apakah policy DNS Hagezi sudah ada
   let dnsPolicy = allPolicies.find(p => p.name === dnsPolicyName);
 
   if (dnsPolicy) {
@@ -164,7 +187,6 @@ async function main() {
   const httpPolicyName = "Hagezi Blocklist - HTTP";
   const httpTrafficExpression = listIds.map(id => buildClause(id, "http")).join(" or ");
 
-  // Cari apakah policy HTTP Hagezi sudah ada
   let httpPolicy = allPolicies.find(p => p.name === httpPolicyName);
 
   if (httpPolicy) {
