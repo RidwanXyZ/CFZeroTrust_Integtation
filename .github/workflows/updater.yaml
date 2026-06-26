@@ -22,4 +22,6 @@ jobs:
         env:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_DNS_POLICY_ID: ${{ secrets.CF_DNS_POLICY_ID }}
+          CF_HTTP_POLICY_ID: ${{ secrets.CF_HTTP_POLICY_ID }}
         run: node dns_http_updater.js
