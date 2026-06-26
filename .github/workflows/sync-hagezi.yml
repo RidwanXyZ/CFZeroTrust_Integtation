@@ -1,0 +1,29 @@
+name: Sync Hagezi → Cloudflare Gateway
+
+on:
+  schedule:
+    # Jalan tiap Senin jam 02.00 WIB (19.00 UTC Minggu)
+    - cron: "0 19 * * 0"
+  workflow_dispatch: # Bisa trigger manual dari GitHub Actions tab
+
+jobs:
+  sync:
+    name: Sync Hagezi Lists
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run sync script
+        env:
+          CF_ACCOUNT_ID:    ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN:     ${{ secrets.CF_API_TOKEN }}
+          CF_DNS_POLICY_ID: ${{ secrets.CF_DNS_POLICY_ID }}
+          CF_HTTP_POLICY_ID: ${{ secrets.CF_HTTP_POLICY_ID }}
+        run: node sync-hagezi.js
