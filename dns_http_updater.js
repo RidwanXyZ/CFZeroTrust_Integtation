@@ -62,7 +62,7 @@ async function getAllLists() {
 
   console.log("  [API] Mengambil daftar list dari Cloudflare...");
   while (true) {
-    const json = await cfFetch(`/rules/lists?per_page=${per_page}&page=${page}`);
+    const json = await cfFetch(`/gateway/lists?per_page=${per_page}&page=${page}`);
     const result = json.result || [];
     all.push(...result);
 
