@@ -1,15 +1,19 @@
 /**
  * sync-hagezi.js
- * Fetch Hagezi lists → auto-split per 1000 → push ke Cloudflare Gateway Lists
- * lalu append semua list ID baru ke DNS & HTTP Policy yang existing.
+ * Fetch Hagezi lists → auto-split per 1000 → upsert to Cloudflare Gateway Lists
+ * lalu update DNS & HTTP Policy tanpa restart dari awal kalau kena limit.
+ *
+ * Run:
+ *   CF_ACCOUNT_ID=... CF_API_TOKEN=... CF_DNS_POLICY_ID=... CF_HTTP_POLICY_ID=... node sync-hagezi.js
  */
 
 const ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
-const API_TOKEN  = process.env.CF_API_TOKEN;
-const DNS_POLICY_ID  = process.env.CF_DNS_POLICY_ID;
+const API_TOKEN = process.env.CF_API_TOKEN;
+const DNS_POLICY_ID = process.env.CF_DNS_POLICY_ID;
 const HTTP_POLICY_ID = process.env.CF_HTTP_POLICY_ID;
 
-const BASE_URL = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/gateway`;
+const BASE_URL = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}`;
+const STATE_FILE = "./.sync-hagezi-state.json";
 
 const HAGEZI_LISTS = [
   {
@@ -34,9 +38,14 @@ const HAGEZI_LISTS = [
   },
 ];
 
-const CHUNK_SIZE = 1000000;
+// Keep safe for Cloudflare list item limits.
+const CHUNK_SIZE = 1000;
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+function mustEnv(name) {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing env: ${name}`);
+  return value;
+}
 
 function cfHeaders() {
   return {
@@ -45,146 +54,227 @@ function cfHeaders() {
   };
 }
 
+async function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRateLimitError(err) {
+  const msg = String(err?.message || err);
+  return /429|rate limit|too many requests|quota/i.test(msg);
+}
+
 async function cfFetch(path, method = "GET", body = null) {
   const res = await fetch(`${BASE_URL}${path}`, {
     method,
     headers: cfHeaders(),
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
-  const json = await res.json();
-  if (!json.success) throw new Error(`CF API error on ${method} ${path}: ${JSON.stringify(json.errors)}`);
+
+  let json = null;
+  try {
+    json = await res.json();
+  } catch (_) {
+    // ignore
+  }
+
+  if (!res.ok || json?.success === false) {
+    const detail =
+      json?.errors?.length
+        ? JSON.stringify(json.errors)
+        : json?.messages?.length
+          ? JSON.stringify(json.messages)
+          : `${res.status} ${res.statusText}`;
+    throw new Error(`CF API error on ${method} ${path}: ${detail}`);
+  }
+
   return json;
 }
 
-/** Fetch & parse domain list — skip comments dan baris kosong */
-async function fetchDomains(url) {
-  console.log(`  Fetching ${url} ...`);
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`);
-  const text = await res.text();
-  return text
-    .split("\n")
-    .map(l => l.trim())
-    .filter(l => l && !l.startsWith("#") && !l.startsWith("!") && l.includes("."));
-}
-
-/** Split array jadi chunks */
 function chunkArray(arr, size) {
   const chunks = [];
   for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
   return chunks;
 }
 
-// ── Gateway List operations ───────────────────────────────────────────────────
-
-/** Ambil semua existing lists */
-async function getAllLists() {
-  const json = await cfFetch("/lists");
-  return json.result || [];
+function unique(arr) {
+  return [...new Set(arr)];
 }
 
-/** Hapus list by ID */
-async function deleteList(id, name) {
-  await cfFetch(`/lists/${id}`, "DELETE");
-  console.log(`  🗑  Deleted old list: ${name} (${id})`);
+async function fetchDomains(url) {
+  console.log(`  Fetching ${url} ...`);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`);
+
+  const text = await res.text();
+  const domains = text
+    .split("\n")
+    .map((l) => l.trim().toLowerCase())
+    .filter((l) => l && !l.startsWith("#") && !l.startsWith("!") && l.includes("."));
+
+  return unique(domains);
 }
 
-/** Buat list baru */
-async function createList(name, description, domains) {
-  const items = domains.map(d => ({ value: d }));
-  const json = await cfFetch("/lists", "POST", {
-    name,
-    description,
-    type: "DOMAIN",
-    items,
+function listItemFromDomain(domain) {
+  return {
+    hostname: {
+      url_hostname: domain,
+      exclude_exact_hostname: false,
+    },
+    comment: "Synced from Hagezi",
+  };
+}
+
+function buildClause(id, trafficKey) {
+  return trafficKey === "dns"
+    ? `any(dns.domains[*] in $${id})`
+    : `any(http.request.domains[*] in $${id})`;
+}
+
+function stripOldHageziClauses(traffic, oldListIds, trafficKey) {
+  const source = String(traffic || "").trim();
+  if (!source || !oldListIds?.length) return source;
+
+  const parts = source.split(/\s+or\s+/);
+  const selectorHint = trafficKey === "dns" ? "dns.domains[*]" : "http.request.domains[*]";
+
+  const filtered = parts.filter((part) => {
+    return !oldListIds.some((id) => part.includes(`$${id}`) && part.includes(selectorHint));
   });
-  return json.result.id;
+
+  return filtered.join(" or ").replace(/\s+/g, " ").trim();
 }
 
-// ── Policy operations ─────────────────────────────────────────────────────────
+function injectListIds(policy, newListIds, trafficKey, oldListIds = []) {
+  const updatedPolicy = JSON.parse(JSON.stringify(policy));
+  const baseTraffic = stripOldHageziClauses(updatedPolicy.traffic || "", oldListIds, trafficKey);
+  const uniqueNewIds = unique(newListIds.filter(Boolean));
 
-async function getPolicy(type, policyId) {
-  const json = await cfFetch(`/${type}/rules/${policyId}`);
-  return json.result;
-}
-
-/**
- * Append list IDs ke rule block yang existing.
- * Cari traffic condition bertipe "any" yang sudah ada,
- * lalu inject list IDs baru ke dalamnya.
- */
-function injectListIds(policy, newListIds, trafficKey) {
-  const updatedPolicy = JSON.parse(JSON.stringify(policy)); // deep clone
-
-  // Cari kondisi block di traffic
-  const traffic = updatedPolicy.traffic || "";
-
-  // Build tambahan kondisi list
-  // Format CF expression: any(dns.domains[*] in $list_id) untuk DNS
-  //                       any(http.request.domains[*] in $list_id) untuk HTTP
-  const prefix = trafficKey === "dns"
-    ? "any(dns.domains[*] in $"
-    : "any(http.request.domains[*] in $";
-
-  const newConditions = newListIds.map(id => `${prefix}${id.replace(/-/g, "")})`);
-
-  // Append ke traffic expression yang existing
+  const newConditions = uniqueNewIds.map((id) => buildClause(id, trafficKey));
   const appended = newConditions.join(" or ");
-  updatedPolicy.traffic = traffic
-    ? `(${traffic}) or ${appended}`
+
+  updatedPolicy.traffic = baseTraffic
+    ? `(${baseTraffic}) or ${appended}`
     : appended;
 
   return updatedPolicy;
 }
 
-async function updatePolicy(type, policyId, updatedPolicy) {
-  // Cloudflare hanya butuh field tertentu saat update
+async function getAllLists() {
+  const all = [];
+  let page = 1;
+  const per_page = 100;
+
+  while (true) {
+    const json = await cfFetch(`/rules/lists?per_page=${per_page}&page=${page}`);
+    const result = json.result || [];
+    all.push(...result);
+
+    const info = json.result_info;
+    if (!info || page >= info.total_pages) break;
+    page += 1;
+  }
+
+  return all;
+}
+
+async function deleteList(id, name) {
+  await cfFetch(`/rules/lists/${id}`, "DELETE");
+  console.log(`  🗑 Deleted old list: ${name} (${id})`);
+}
+
+async function createList(name, description, domains) {
+  const createJson = await cfFetch("/rules/lists", "POST", {
+    kind: "hostname",
+    name,
+    description,
+  });
+
+  const listId = createJson.result.id;
+  const items = domains.map(listItemFromDomain);
+
+  if (items.length > 0) {
+    const itemsJson = await cfFetch(`/rules/lists/${listId}/items`, "POST", items);
+
+    const operationId =
+      itemsJson.result?.operation_id ||
+      itemsJson.result?.id ||
+      itemsJson.result?.operation?.id;
+
+    if (operationId) {
+      await waitForBulkOperation(operationId);
+    }
+  }
+
+  return listId;
+}
+
+async function waitForBulkOperation(operationId) {
+  for (let i = 0; i < 60; i++) {
+    const json = await cfFetch(`/rules/lists/bulk_operations/${operationId}`);
+    const status = json.result?.status;
+
+    if (status === "completed") return json.result;
+    if (status === "failed") {
+      throw new Error(`Bulk operation failed: ${json.result?.error || "unknown error"}`);
+    }
+
+    await sleep(2000);
+  }
+
+  throw new Error(`Bulk operation timeout: ${operationId}`);
+}
+
+async function getPolicy(policyId) {
+  const json = await cfFetch(`/gateway/rules/${policyId}`);
+  return json.result;
+}
+
+async function updatePolicy(policyId, updatedPolicy) {
   const payload = {
-    name:        updatedPolicy.name,
+    name: updatedPolicy.name,
     description: updatedPolicy.description,
-    action:      updatedPolicy.action,
-    enabled:     updatedPolicy.enabled,
-    traffic:     updatedPolicy.traffic,
-    filters:     updatedPolicy.filters,
+    action: updatedPolicy.action,
+    enabled: updatedPolicy.enabled,
+    traffic: updatedPolicy.traffic,
+    filters: updatedPolicy.filters,
+    precedence: updatedPolicy.precedence,
   };
-  await cfFetch(`/${type}/rules/${policyId}`, "PUT", payload);
+
+  await cfFetch(`/gateway/rules/${policyId}`, "PUT", payload);
 }
 
-// ── Cleanup old hagezi lists ──────────────────────────────────────────────────
-
-async function cleanupOldLists(allLists) {
-  const oldLists = allLists.filter(l => l.name.startsWith("hagezi-"));
-  if (oldLists.length === 0) {
-    console.log("  Tidak ada list Hagezi lama yang perlu dihapus.");
-    return;
+function groupExistingListsByName(allLists) {
+  const map = new Map();
+  for (const item of allLists) {
+    if (item?.name && item?.id) map.set(item.name, item.id);
   }
-  for (const l of oldLists) {
-    await deleteList(l.id, l.name);
-  }
+  return map;
 }
-
-// ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
   console.log("🚀 Hagezi → Cloudflare Gateway Sync\n");
 
-  // Validasi env
-  for (const key of ["CF_ACCOUNT_ID", "CF_API_TOKEN", "CF_DNS_POLICY_ID", "CF_HTTP_POLICY_ID"]) {
-    if (!process.env[key]) throw new Error(`Missing env: ${key}`);
-  }
+  mustEnv("CF_ACCOUNT_ID");
+  mustEnv("CF_API_TOKEN");
+  mustEnv("CF_DNS_POLICY_ID");
+  mustEnv("CF_HTTP_POLICY_ID");
 
-  /**
-  // 1. Hapus list Hagezi lama
-  console.log("📋 Step 1: Cleanup existing Hagezi lists...");
+  // Collect existing Hagezi lists first so script can resume without recreating from zero.
+  console.log("📋 Step 1: Scan existing Hagezi lists...");
   const allLists = await getAllLists();
-  await cleanupOldLists(allLists);
+  const existingHagezi = allLists.filter((l) => String(l.name || "").startsWith("hagezi-"));
+  const existingByName = groupExistingListsByName(existingHagezi);
 
-  // 2. Fetch & push list baru
-  console.log("\n📥 Step 2: Fetch & create new lists...");
+  console.log(`  Existing Hagezi lists: ${existingHagezi.length}`);
+
   const allNewListIds = [];
+  let creationHitLimit = false;
 
+  // Upsert phase: reuse existing list IDs; create missing ones only.
+  console.log("\n📥 Step 2: Fetch & upsert Hagezi lists...");
   for (const hagezi of HAGEZI_LISTS) {
     console.log(`\n▶ Processing: ${hagezi.name}`);
+
     const domains = await fetchDomains(hagezi.url);
     console.log(`  Total domains: ${domains.length.toLocaleString()}`);
 
@@ -196,37 +286,61 @@ async function main() {
         ? hagezi.name
         : `${hagezi.name}-${String(i + 1).padStart(3, "0")}`;
 
-      const id = await createList(listName, hagezi.description, chunks[i]);
-      allNewListIds.push(id);
-      console.log(`  ✅ Created: ${listName} (${chunks[i].length} domains) → ID: ${id}`);
+      const existingId = existingByName.get(listName);
+      if (existingId) {
+        allNewListIds.push(existingId);
+        console.log(`  ↩ Reuse existing: ${listName} → ID: ${existingId}`);
+        continue;
+      }
+
+      try {
+        const id = await createList(listName, hagezi.description, chunks[i]);
+        allNewListIds.push(id);
+        existingByName.set(listName, id);
+        console.log(`  ✅ Created: ${listName} (${chunks[i].length} domains) → ID: ${id}`);
+      } catch (err) {
+        if (isRateLimitError(err)) {
+          console.log("  ⚠ Rate limit / limit kena. Stop create, lanjut update policy.");
+          creationHitLimit = true;
+          break;
+        }
+        throw err;
+      }
     }
+
+    if (creationHitLimit) break;
   }
 
-  console.log(`\n📊 Total lists created: ${allNewListIds.length}`);
-  **/
-  
-  // 3. Update DNS Policy
+  if (allNewListIds.length === 0) {
+    throw new Error("No Hagezi list IDs available. Policy update skipped.");
+  }
+
+  console.log(`\n📊 List ID ready: ${allNewListIds.length}`);
+
+  // Update DNS Policy
   console.log("\n🔒 Step 3: Update DNS Policy...");
-  const dnsPolicy = await getPolicy("dns", DNS_POLICY_ID);
+  const dnsPolicy = await getPolicy(DNS_POLICY_ID);
   console.log(`  Policy: "${dnsPolicy.name}"`);
   console.log(`  Traffic expression sebelum:\n  ${dnsPolicy.traffic}`);
+
   const updatedDns = injectListIds(dnsPolicy, allNewListIds, "dns");
-  await updatePolicy("dns", DNS_POLICY_ID, updatedDns);
+  await updatePolicy(DNS_POLICY_ID, updatedDns);
   console.log("  ✅ DNS Policy updated!");
 
-  // 4. Update HTTP Policy
+  // Update HTTP Policy
   console.log("\n🌐 Step 4: Update HTTP Policy...");
-  const httpPolicy = await getPolicy("http", HTTP_POLICY_ID);
+  const httpPolicy = await getPolicy(HTTP_POLICY_ID);
   console.log(`  Policy: "${httpPolicy.name}"`);
   console.log(`  Traffic expression sebelum:\n  ${httpPolicy.traffic}`);
+
   const updatedHttp = injectListIds(httpPolicy, allNewListIds, "http");
-  await updatePolicy("http", HTTP_POLICY_ID, updatedHttp);
+  await updatePolicy(HTTP_POLICY_ID, updatedHttp);
   console.log("  ✅ HTTP Policy updated!");
 
   console.log("\n🎉 Sync selesai! Semua list Hagezi berhasil dipush ke Cloudflare Gateway.");
 }
 
-main().catch(err => {
+main().catch((err) => {
   console.error("\n❌ Error:", err.message);
   process.exit(1);
 });
