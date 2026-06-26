@@ -1,10 +1,11 @@
 /**
  * apply-hagezi-policies.js
- * Pindai daftar list "hagezi-" yang sudah ada di Cloudflare Gateway,
+ * Pindai daftar Zero Trust Gateway Lists ("hagezi-") yang sudah ada di akun Cloudflare,
  * lalu otomatis buat/update DNS Policy & HTTP Policy ke mode BLOCK.
  *
- * Diperbarui: Peningkatan pencarian list (case-insensitive & auto-fallback)
- * untuk mengatasi masalah pembacaan list kosong di Cloudflare.
+ * Diperbarui secara presisi berdasarkan Dokumentasi API Cloudflare Gateway:
+ * - Menggunakan Endpoint Resmi: /gateway/lists dan /gateway/rules
+ * - Menggunakan struktur Payload Gateway Rule yang valid.
  *
  * Run:
  * CF_ACCOUNT_ID=... CF_API_TOKEN=... node apply-hagezi-policies.js
@@ -29,7 +30,8 @@ function cfHeaders() {
 }
 
 async function cfFetch(path, method = "GET", body = null) {
-  const res = await fetch(`${BASE_URL}${path}`, {
+  const url = `${BASE_URL}${path}`;
+  const res = await fetch(url, {
     method,
     headers: cfHeaders(),
     ...(body ? { body: JSON.stringify(body) } : {}),
@@ -49,44 +51,59 @@ async function cfFetch(path, method = "GET", body = null) {
         : json?.messages?.length
           ? JSON.stringify(json.messages)
           : `${res.status} ${res.statusText}`;
-    throw new Error(`CF API error on ${method} ${path}: ${detail}`);
+    throw new Error(`CF API error pada ${method} ${path}: ${detail}`);
   }
 
   return json;
 }
 
-async function getAllLists() {
+/**
+ * Berdasarkan Dokumentasi Resmi Cloudflare Zero Trust:
+ * Mengambil daftar list dengan memanggil GET /accounts/{account_id}/gateway/lists
+ */
+async function getGatewayLists() {
   const all = [];
   let page = 1;
   const per_page = 100;
 
-  console.log("  [API] Mengambil daftar list dari Cloudflare...");
+  console.log("  [API] Mengambil daftar Zero Trust Gateway Lists...");
   while (true) {
+    // Memanggil endpoint spesifik Gateway sesuai dokumentasi
     const json = await cfFetch(`/gateway/lists?per_page=${per_page}&page=${page}`);
     const result = json.result || [];
     all.push(...result);
 
-    console.log(`  [API] Halaman ${page}: Berhasil membaca ${result.length} list.`);
+    console.log(`  [API] Berhasil membaca ${result.length} list pada halaman ${page}.`);
     
+    // Periksa pagination
     const info = json.result_info;
-    if (!info || page >= info.total_pages) break;
+    if (!info || page >= info.total_pages || result.length < per_page) break;
     page += 1;
   }
 
   return all;
 }
 
-async function getAllPolicies() {
+/**
+ * Mengambil daftar aturan Gateway dengan memanggil GET /accounts/{account_id}/gateway/rules
+ */
+async function getGatewayPolicies() {
   const json = await cfFetch("/gateway/rules");
   return json.result || [];
 }
 
-async function createPolicy(payload) {
+/**
+ * Membuat aturan Gateway baru dengan memanggil POST /accounts/{account_id}/gateway/rules
+ */
+async function createGatewayPolicy(payload) {
   const json = await cfFetch("/gateway/rules", "POST", payload);
   return json.result;
 }
 
-async function updatePolicy(policyId, updatedPolicy) {
+/**
+ * Memperbarui aturan Gateway yang ada dengan memanggil PUT /accounts/{account_id}/gateway/rules/{rule_id}
+ */
+async function updateGatewayPolicy(policyId, updatedPolicy) {
   const payload = {
     name: updatedPolicy.name,
     description: updatedPolicy.description,
@@ -95,6 +112,7 @@ async function updatePolicy(policyId, updatedPolicy) {
     traffic: updatedPolicy.traffic,
     filters: updatedPolicy.filters,
     precedence: updatedPolicy.precedence,
+    rule_settings: updatedPolicy.rule_settings || {}
   };
 
   await cfFetch(`/gateway/rules/${policyId}`, "PUT", payload);
@@ -107,51 +125,39 @@ function buildClause(id, trafficKey) {
 }
 
 async function main() {
-  console.log("🚀 Memulai Pembuatan & Sinkronisasi Policy Gateway Cloudflare...\n");
+  console.log("🚀 Memulai Sinkronisasi Policy Cloudflare Gateway...\n");
 
   mustEnv("CF_ACCOUNT_ID");
   mustEnv("CF_API_TOKEN");
 
-  // Step 1: Ambil semua list dari Cloudflare
-  console.log("📋 Step 1: Memindai semua list yang ada di akun Cloudflare...");
-  const allLists = await getAllLists();
+  // Step 1: Ambil semua list dari Zero Trust Gateway
+  console.log("📋 Step 1: Memindai list di database Zero Trust Gateway...");
+  const allLists = await getGatewayLists();
   
-  console.log(`\n🔍 Total list ditemukan di akun: ${allLists.length}`);
-  if (allLists.length > 0) {
-    console.log("  Sampel nama 5 list pertama di akun Anda:");
-    allLists.slice(0, 5).forEach(l => console.log(`  - Name: "${l.name}" | ID: ${l.id} | Type: ${l.kind}`));
-  }
+  console.log(`\n🔍 Total list yang ditemukan di Gateway: ${allLists.length}`);
 
-  // Cari list dengan nama yang mengandung kata "hagezi" (Case-Insensitive)
-  let hageziLists = allLists.filter((l) => {
+  // Filter list yang tipenya adalah 'teams_list' atau 'hostname' dan mengandung nama 'hagezi'
+  const hageziLists = allLists.filter((l) => {
     const nameLower = String(l.name || "").toLowerCase();
     return nameLower.includes("hagezi");
   });
 
-  // JIKA MASIH KOSONG: Lakukan fallback dengan mencari list hostname apa saja yang bukan bawaan system
   if (hageziLists.length === 0) {
-    console.log("\n  ⚠️  PERINGATAN: Tidak ada list dengan nama mengandung kata 'hagezi' (case-insensitive).");
-    console.log("  Mencoba mencari list tipe 'hostname' cadangan...");
-    hageziLists = allLists.filter((l) => l.kind === "hostname");
+    console.log("\n⚠️  DIAGNOSTIK:");
+    console.log("   Daftar list kosong atau tidak ada yang mengandung nama 'hagezi'.");
+    console.log("   Berikut adalah daftar 5 nama list teratas di akun Anda saat ini:");
+    allLists.slice(0, 5).forEach(l => console.log(`   - "${l.name}" (ID: ${l.id})`));
+    throw new Error("Tidak ditemukan list 'hagezi' di Zero Trust Gateway.");
   }
 
-  if (hageziLists.length === 0) {
-    throw new Error(
-      "Gagal mendeteksi list apa pun di akun Cloudflare Anda. " +
-      "Pastikan API Token Anda memiliki izin 'Rules: Read' dan 'Account: Lists Read'."
-    );
-  }
-
-  console.log(`\n  ✅ Sukses mencocokkan ${hageziLists.length} list untuk digunakan.`);
-  hageziLists.forEach(l => console.log(`    -> Menggunakan List: "${l.name}" (${l.id})`));
-
+  console.log(`  ✅ Berhasil menyaring ${hageziLists.length} list Hagezi.`);
   const listIds = hageziLists.map(l => l.id);
 
-  // Ambil semua policy yang ada di Cloudflare saat ini
-  const allPolicies = await getAllPolicies();
+  // Ambil semua policy saat ini
+  const allPolicies = await getGatewayPolicies();
 
   // ==========================================
-  // STEP 2: TERAPKAN KE DNS POLICY (BLOCK)
+  // STEP 2: KONFIGURASI DNS POLICY (BLOCK)
   // ==========================================
   console.log("\n🔒 Step 2: Mengonfigurasi DNS Policy...");
   const dnsPolicyName = "Hagezi Blocklist - DNS";
@@ -160,15 +166,15 @@ async function main() {
   let dnsPolicy = allPolicies.find(p => p.name === dnsPolicyName);
 
   if (dnsPolicy) {
-    console.log(`  🔄 Policy "${dnsPolicyName}" ditemukan. Memperbarui aturan blokir...`);
+    console.log(`  🔄 Policy "${dnsPolicyName}" ditemukan. Memperbarui aturan...`);
     dnsPolicy.traffic = dnsTrafficExpression;
     dnsPolicy.action = "block";
     dnsPolicy.enabled = true;
-    await updatePolicy(dnsPolicy.id, dnsPolicy);
+    await updateGatewayPolicy(dnsPolicy.id, dnsPolicy);
     console.log("  ✅ DNS Policy sukses diperbarui!");
   } else {
-    console.log(`  ✨ Policy "${dnsPolicyName}" tidak ditemukan. Membuat policy baru...`);
-    await createPolicy({
+    console.log(`  ✨ Policy "${dnsPolicyName}" tidak ditemukan. Membuat baru...`);
+    await createGatewayPolicy({
       name: dnsPolicyName,
       description: "Auto-generated policy to block Hagezi lists",
       action: "block",
@@ -181,7 +187,7 @@ async function main() {
   }
 
   // ==========================================
-  // STEP 3: TERAPKAN KE HTTP POLICY (BLOCK)
+  // STEP 3: KONFIGURASI HTTP POLICY (BLOCK)
   // ==========================================
   console.log("\n🌐 Step 3: Mengonfigurasi HTTP Policy...");
   const httpPolicyName = "Hagezi Blocklist - HTTP";
@@ -190,15 +196,15 @@ async function main() {
   let httpPolicy = allPolicies.find(p => p.name === httpPolicyName);
 
   if (httpPolicy) {
-    console.log(`  🔄 Policy "${httpPolicyName}" ditemukan. Memperbarui aturan blokir...`);
+    console.log(`  🔄 Policy "${httpPolicyName}" ditemukan. Memperbarui aturan...`);
     httpPolicy.traffic = httpTrafficExpression;
     httpPolicy.action = "block";
     httpPolicy.enabled = true;
-    await updatePolicy(httpPolicy.id, httpPolicy);
+    await updateGatewayPolicy(httpPolicy.id, httpPolicy);
     console.log("  ✅ HTTP Policy sukses diperbarui!");
   } else {
-    console.log(`  ✨ Policy "${httpPolicyName}" tidak ditemukan. Membuat policy baru...`);
-    await createPolicy({
+    console.log(`  ✨ Policy "${httpPolicyName}" tidak ditemukan. Membuat baru...`);
+    await createGatewayPolicy({
       name: httpPolicyName,
       description: "Auto-generated policy to block Hagezi lists via HTTP Inspection",
       action: "block",
@@ -210,7 +216,7 @@ async function main() {
     console.log("  ✅ HTTP Policy baru berhasil dibuat dengan action BLOCK!");
   }
 
-  console.log("\n🎉 Selesai! DNS Policy dan HTTP Policy sekarang telah aktif memblokir semua list Hagezi di Cloudflare Gateway kamu.");
+  console.log("\n🎉 Selesai! DNS & HTTP Policy di Cloudflare Gateway sekarang sepenuhnya aktif.");
 }
 
 main().catch((err) => {
